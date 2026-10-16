@@ -1,0 +1,102 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="theme-color" content="#090a0c" />
+    <title>Line Art Live</title>
+  </head>
+  <body>
+    <main class="shell">
+      <header>
+        <div>
+          <p class="eyebrow">ON-DEVICE VIDEO EFFECT</p>
+          <h1>Line Art <em>Live</em></h1>
+        </div>
+        <div class="status"><span id="statusDot"></span><span id="status">Loading model…</span></div>
+      </header>
+
+      <section class="controls" aria-label="Effect controls">
+        <label>
+          <span>Detector</span>
+          <select id="detector">
+            <option value="teed">TEED · fast</option>
+            <option value="teed-person">TEED · person-tuned</option>
+            <option value="pidinet">PiDiNet Small · detailed</option>
+            <option value="canny">Canny · classic</option>
+          </select>
+        </label>
+        <label>
+          <span>Effect</span>
+          <select id="effect">
+            <option value="neon">Neon edges</option>
+            <option value="ink">Ink overlay</option>
+            <option value="mask">Line mask</option>
+            <option value="person-debug">Person mask · green screen</option>
+          </select>
+        </label>
+        <label>
+          <span>Person model</span>
+          <select id="segmenter">
+            <option value="mediapipe">MediaPipe · landscape</option>
+            <option value="rvm-fp32">RVM MobileNetV3 · FP32</option>
+            <option value="rvm-fp16">RVM MobileNetV3 · FP16</option>
+          </select>
+        </label>
+        <label>
+          <span>Threshold <output id="thresholdValue">0.35</output></span>
+          <input id="threshold" type="range" min="0" max="0.95" step="0.01" value="0.35" />
+        </label>
+        <label>
+          <span>Strength <output id="strengthValue">0.85</output></span>
+          <input id="strength" type="range" min="0" max="1" step="0.01" value="0.85" />
+        </label>
+        <label class="color-control">
+          <span>Edge color</span>
+          <input id="color" type="color" value="#68f6ff" />
+        </label>
+        <label>
+          <span>Mask threshold <output id="personThresholdValue">0.33</output></span>
+          <input id="personThreshold" type="range" min="0.05" max="0.85" step="0.01" value="0.33" disabled />
+        </label>
+        <label class="toggle-control">
+          <span>Person only</span>
+          <span class="switch">
+            <input id="personMask" type="checkbox" />
+            <span aria-hidden="true"></span>
+          </span>
+        </label>
+        <button id="sourceButton" type="button">Change source</button>
+      </section>
+
+      <section class="stage" id="dropZone">
+        <canvas id="output" aria-label="Processed video output"></canvas>
+        <div class="empty" id="emptyState">
+          <div class="drop-icon">↘</div>
+          <h2>Drop a video here</h2>
+          <p>or use your webcam for a live preview</p>
+          <div class="source-buttons">
+            <button id="fileButton" class="primary" type="button">Choose video</button>
+            <button id="cameraButton" type="button">Use webcam</button>
+          </div>
+        </div>
+        <div class="drop-prompt" id="dropPrompt">Drop to open</div>
+        <div class="metrics" id="metrics">— ms · — fps</div>
+      </section>
+
+      <footer>
+        <span>Frames stay on this device.</span>
+        <span id="backend">Preparing runtime</span>
+      </footer>
+    </main>
+
+    <input id="fileInput" type="file" accept="video/*" hidden />
+    <video id="video" muted playsinline loop hidden></video>
+    <canvas id="frameCanvas" hidden></canvas>
+    <canvas id="modelInput" width="320" height="320" hidden></canvas>
+    <canvas id="maskCanvas" width="320" height="320" hidden></canvas>
+    <canvas id="personMaskCanvas" width="320" height="320" hidden></canvas>
+    <canvas id="personLayer" hidden></canvas>
+    <script type="module" src="/src/main.js"></script>
+  </body>
+</html>

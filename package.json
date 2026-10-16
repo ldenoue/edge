@@ -1,0 +1,18 @@
+{
+  "name": "line-art-live",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "@mediapipe/selfie_segmentation": "^0.1.1675465747",
+    "onnxruntime-web": "^1.23.2"
+  },
+  "devDependencies": {
+    "vite": "^7.1.7"
+  }
+}
