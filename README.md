@@ -18,7 +18,8 @@ a segmentation mask.
 | Option | Purpose | Runtime notes |
 | --- | --- | --- |
 | TEED | General semantic edges | 320×320 ONNX; WebGPU with WASM fallback |
-| TEED Person | Human-prioritized edges without a runtime mask | Same 243 KiB architecture as TEED |
+| TEED Person V2 | Human-prioritized edges with corrected masks and hard negatives | Same 243 KiB architecture as TEED |
+| TEED Person V1 | Original three-epoch person experiment | Kept for direct A/B comparison |
 | PiDiNet Small | Fewer, heavier perceptual boundaries | 320×320 ONNX |
 | Canny | Classical image edges | Plain JavaScript |
 | MediaPipe | Optional person-mask gate | Landscape selfie-segmentation model |
@@ -57,16 +58,90 @@ npm run dev
 
 ## Prepare CIHP person-edge data
 
+### Dataset source and layout
+
+Training uses the **Crowd Instance-level Human Parsing (CIHP)** dataset
+introduced by Gong et al. in *Instance-level Human Parsing via Part Grouping
+Network* (ECCV 2018). The official
+[CIHP/PGN repository](https://github.com/Engineering-Course/CIHP_PGN) links the
+dataset downloads; the
+[paper](https://openaccess.thecvf.com/content_ECCV_2018/papers/Ke_Gong_Instance-level_Human_Parsing_ECCV_2018_paper.pdf)
+describes its collection and annotations. CIHP contains 38,280 images split
+into 28,280 training, 5,000 validation, and 5,000 test images. We only use the
+publicly annotated training and validation splits. Review the dataset's terms
+before downloading or redistributing it; the dataset itself is not committed
+to this repository.
+
+Extract the download so it has this shape (the root directory name may vary):
+
+```text
+instance-level_human_parsing/
+├── Training/
+│   ├── Images/*.jpg
+│   ├── Human_ids/*.png
+│   └── Category_ids/*.png
+├── Validation/
+│   ├── Images/*.jpg
+│   ├── Human_ids/*.png
+│   └── Category_ids/*.png
+└── Testing/Images/*.jpg
+```
+
+`Human_ids` assigns each person a non-zero integer instance ID.
+`Category_ids` assigns the background or one of 19 semantic human-part labels.
+The preparation script does not copy source images; manifests contain absolute
+paths to the local extraction.
+
+### Reproduce the manifests
+
+Create a Python environment and fetch the stock TEED implementation/checkpoint:
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
+python -m pip install -r requirements-training.txt
+git clone --depth 1 https://github.com/xavysp/TEED.git vendor/TEED
+```
+
 Build balanced train and validation manifests from a local CIHP download:
 
 ```bash
-python3 scripts/prepare_cihp_person_edges.py
+python3 scripts/prepare_cihp_person_edges.py \
+  --dataset ~/Downloads/instance-level_human_parsing \
+  --negative-ratio 0.25 --seed 1021
 ```
 
 The default output is `data/cihp_person_edges`. Source images are referenced in
 place, and training targets can be generated lazily to conserve disk space. Add
 `--cache-targets` only when enough free space is available to materialize all
 320x320 target PNGs.
+
+Candidate selection is deterministic and works per annotated instance. An
+image is selected when at least one person has a head label, a torso label,
+both leg labels, a bounding-box height of at least 50% of the image, an area of
+at least 2.5%, and no top/bottom clipping. The union mask and target still
+include every person in a selected image, including partially visible secondary
+people. Scanning the official splits produces 4,106 training and 732 validation
+positive images.
+
+CIHP contains people in every image, so it does not provide genuine no-person
+frames. Instead, the script derives safe hard negatives from annotated
+background regions:
+
+1. Random candidate crops cover 35–70% of the source width and height and are
+   at least 64 pixels in each dimension.
+2. A crop is rejected if it or a 2% safety margin contains any non-zero
+   `Human_ids` pixel.
+3. Up to 40 candidates are tested per image. The candidate with the greatest
+   grayscale gradient energy plus `0.15 ×` intensity standard deviation is kept,
+   favoring clutter over blank sky or walls.
+4. At the default ratio, generation stops after 1,026 training and 183
+   validation negatives (25% as many negatives as positives).
+
+The positive manifests are `training.jsonl` and `validation.jsonl`; hard
+negatives are written separately as `training_negatives.jsonl` and
+`validation_negatives.jsonl`. Use `--negative-ratio 0` to disable them.
 
 ### How TEED Person was trained
 
@@ -81,7 +156,10 @@ one instance has:
 - at least 2.5% of the image area; and
 - no clipping at the top or bottom boundary.
 
-This produced **4,106 training images and 732 validation images**. Once an image
+This produced **4,106 training images and 732 validation images**. V2 also uses
+**1,026 training and 183 validation hard negatives**. These are high-texture,
+mask-verified background crops taken from CIHP images with a safety margin from
+every annotated person. Once an image
 is selected, the target mask contains *every* annotated person, including
 partially visible secondary people, so the model is never taught that another
 human is background.
@@ -100,26 +178,38 @@ target = max(
 This preserves useful internal human edges while setting scene edges to zero.
 All four TEED outputs receive deep supervision with class-balanced binary cross
 entropy, and an additional loss penalizes response outside the union of human
-masks. Training augments horizontal orientation, brightness, and contrast.
+masks. V2 fixes an error in V1 that resized integer instance IDs before
+binarizing them, making a person's soft boundary depend on its instance ID.
+V2 binarizes first, then resizes. Its augmentations cover horizontal flips,
+small random crops and rotations, brightness, contrast, saturation, blur, JPEG
+compression, and sensor-like noise.
 
-The included checkpoint was fine-tuned end-to-end for three epochs with AdamW,
-a `1e-4` learning rate, batch size 16, and 320×320 inputs on Apple MPS. TEED has
-only 58,910 parameters, so the fine-tuned browser model remains 243 KiB and has
-the same inference cost as stock TEED.
+V2 was fine-tuned end-to-end for ten epochs with AdamW, a cosine-decayed `1e-4`
+learning rate, batch size 16, and 320×320 inputs on Apple MPS. Against the held-
+out hard negatives at the browser's `0.18` normalized threshold, visible edge
+pixels fell from 2.08% for V1 to 1.45% for V2 while person-edge response stayed
+effectively unchanged. TEED has only 58,910 parameters, so each fine-tuned
+browser model remains 243 KiB with the same inference cost as stock TEED.
 
-Fine-tune the official BIPED epoch-5 checkpoint on the manifests, then export
-the best checkpoint for the browser:
+Fine-tune the official BIPED epoch-5 checkpoint on the manifests, evaluate V1
+against V2, then export the best checkpoint for the browser:
 
 ```bash
-git clone --depth 1 https://github.com/xavysp/TEED.git vendor/TEED
-python3 scripts/train_teed_person_edges.py --epochs 3 --batch-size 16 --workers 0
-python3 scripts/convert_teed.py checkpoints/teed_person/best.pth \
-  public/teed-person-320.onnx --source vendor/TEED --size 320
+python3 scripts/train_teed_person_edges.py --epochs 10 --batch-size 16 --workers 4 \
+  --output checkpoints/teed_person_v2
+python3 scripts/convert_teed.py checkpoints/teed_person_v2/best.pth \
+  public/teed-person-v2-320.onnx --source vendor/TEED --size 320
+python3 scripts/evaluate_teed_person_edges.py \
+  checkpoints/teed_person/best.pth checkpoints/teed_person_v2/best.pth
+npm run build
 ```
 
 On macOS, PyTorch training uses MPS when available. The frozen original TEED
 model supplies interior edge targets, CIHP supplies the human masks and
 silhouettes, and the loss explicitly penalizes response outside human masks.
+Checkpoints, manifests, cached targets, the TEED checkout, and `dist/` are
+intentionally ignored by Git. The exported ONNX files under `public/` are the
+small deployable artifacts that belong in version control.
 
 Open the printed localhost URL. Drop a browser-supported video onto the stage or
 select **Use webcam**. Webcam access works on localhost or HTTPS.
@@ -127,7 +217,8 @@ select **Use webcam**. Webcam access works on localhost or HTTPS.
 Use the detector picker to compare:
 
 - **TEED** — the fastest neural option and the default.
-- **TEED Person** — prioritizes human edges without enabling **Person only**.
+- **TEED Person V2** — corrected masks, hard negatives, and stronger augmentation.
+- **TEED Person V1** — the original model, retained for A/B comparison.
 - **PiDiNet Small** — more detailed perceptual boundaries with a larger runtime cost.
 - **Canny** — a dependency-free JavaScript implementation with Gaussian blur,
   Sobel gradients, non-maximum suppression, and hysteresis thresholding.

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import random
 from pathlib import Path
 
 import numpy as np
@@ -45,6 +46,13 @@ def parse_args() -> argparse.Namespace:
         help="Maximum selected images per split, useful for a smoke test.",
     )
     parser.add_argument("--preview-count", type=int, default=12)
+    parser.add_argument(
+        "--negative-ratio",
+        type=float,
+        default=0.25,
+        help="Background-only crops to generate relative to selected positive images.",
+    )
+    parser.add_argument("--seed", type=int, default=1021)
     parser.add_argument(
         "--cache-targets",
         action="store_true",
@@ -166,7 +174,79 @@ def make_preview(rows: list[dict], destination: Path) -> None:
     sheet.save(destination, quality=90)
 
 
-def process_split(args: argparse.Namespace, split: str, session: ort.InferenceSession | None) -> int:
+def background_crop(
+    human_ids: np.ndarray,
+    image: Image.Image,
+    rng: random.Random,
+    attempts: int = 40,
+) -> tuple[list[int], float] | None:
+    """Find a textured crop separated from every annotated person."""
+    height, width = human_ids.shape
+    margin_y = max(3, round(height * 0.02))
+    margin_x = max(3, round(width * 0.02))
+    candidates: list[tuple[list[int], float]] = []
+    grayscale = np.asarray(image.convert("L"), dtype=np.float32)
+    for _ in range(attempts):
+        crop_width = rng.randint(max(64, round(width * 0.35)), max(64, round(width * 0.70)))
+        crop_height = rng.randint(max(64, round(height * 0.35)), max(64, round(height * 0.70)))
+        crop_width = min(crop_width, width)
+        crop_height = min(crop_height, height)
+        x0 = rng.randint(0, width - crop_width)
+        y0 = rng.randint(0, height - crop_height)
+        x1, y1 = x0 + crop_width, y0 + crop_height
+        mx0, my0 = max(0, x0 - margin_x), max(0, y0 - margin_y)
+        mx1, my1 = min(width, x1 + margin_x), min(height, y1 + margin_y)
+        if np.any(human_ids[my0:my1, mx0:mx1] > 0):
+            continue
+        patch = grayscale[y0:y1, x0:x1]
+        if patch.size == 0:
+            continue
+        gradient = np.abs(np.diff(patch, axis=0)).mean() + np.abs(np.diff(patch, axis=1)).mean()
+        contrast = patch.std()
+        score = float(gradient + 0.15 * contrast)
+        candidates.append(([x0, y0, x1, y1], score))
+    return max(candidates, key=lambda item: item[1]) if candidates else None
+
+
+def write_negative_manifest(
+    args: argparse.Namespace,
+    split: str,
+    files: list[Path],
+    positive_count: int,
+) -> int:
+    """Write mask-verified, high-texture background crops as hard negatives."""
+    desired = round(positive_count * max(0.0, args.negative_ratio))
+    destination = args.output / f"{split.lower()}_negatives.jsonl"
+    rng = random.Random(f"{args.seed}:{split}")
+    shuffled = files.copy()
+    rng.shuffle(shuffled)
+    written = 0
+    with destination.open("w", encoding="utf-8") as manifest:
+        for human_path in shuffled:
+            if written >= desired:
+                break
+            human_ids = np.asarray(Image.open(human_path))
+            image_path = args.dataset / split / "Images" / f"{human_path.stem}.jpg"
+            with Image.open(image_path) as source:
+                candidate = background_crop(human_ids, source, rng)
+            if candidate is None:
+                continue
+            crop, score = candidate
+            row = {
+                "id": f"{human_path.stem}-background",
+                "image": str(image_path.resolve()),
+                "human_ids": str(human_path.resolve()),
+                "crop": crop,
+                "negative": True,
+                "hardness": round(score, 4),
+            }
+            manifest.write(json.dumps(row, separators=(",", ":")) + "\n")
+            written += 1
+    print(f"{split}: wrote {written} hard negatives to {destination}")
+    return written
+
+
+def process_split(args: argparse.Namespace, split: str, session: ort.InferenceSession | None) -> dict[str, int]:
     source = args.dataset / split
     split_name = split.lower()
     target_dir = args.output / "targets" / split_name
@@ -208,7 +288,8 @@ def process_split(args: argparse.Namespace, split: str, session: ort.InferenceSe
     if session is not None:
         make_preview(preview_rows, args.output / f"{split_name}_preview.jpg")
     print(f"{split}: wrote {selected} rows to {manifest_path}")
-    return selected
+    negatives = write_negative_manifest(args, split, files, selected)
+    return {"positive": selected, "negative": negatives}
 
 
 def main() -> None:

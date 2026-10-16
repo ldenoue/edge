@@ -1,0 +1,5 @@
+numpy>=1.26
+onnx>=1.16
+onnxruntime>=1.18
+Pillow>=10.0
+torch>=2.2

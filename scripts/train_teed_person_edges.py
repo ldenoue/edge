@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import io
 import json
 import random
 import sys
@@ -12,7 +13,7 @@ from types import ModuleType
 import numpy as np
 import torch
 import torch.nn.functional as F
-from PIL import Image, ImageEnhance
+from PIL import Image, ImageEnhance, ImageFilter
 from torch.utils.data import DataLoader, Dataset
 
 
@@ -24,6 +25,16 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--train-manifest", type=Path, default=Path("data/cihp_person_edges/training.jsonl"))
     parser.add_argument("--val-manifest", type=Path, default=Path("data/cihp_person_edges/validation.jsonl"))
+    parser.add_argument(
+        "--train-negative-manifest",
+        type=Path,
+        default=Path("data/cihp_person_edges/training_negatives.jsonl"),
+    )
+    parser.add_argument(
+        "--val-negative-manifest",
+        type=Path,
+        default=Path("data/cihp_person_edges/validation_negatives.jsonl"),
+    )
     parser.add_argument("--source", type=Path, default=Path("vendor/TEED"))
     parser.add_argument(
         "--checkpoint",
@@ -53,11 +64,23 @@ def load_teed(source: Path):
 
 
 class PersonEdgeDataset(Dataset):
-    def __init__(self, manifest: Path, training: bool, limit: int | None = None):
+    def __init__(
+        self,
+        manifest: Path,
+        training: bool,
+        limit: int | None = None,
+        negative_manifest: Path | None = None,
+    ):
         with manifest.open(encoding="utf-8") as handle:
             self.rows = [json.loads(line) for line in handle if line.strip()]
         if limit is not None:
             self.rows = self.rows[:limit]
+        if negative_manifest is not None and negative_manifest.exists():
+            with negative_manifest.open(encoding="utf-8") as handle:
+                negatives = [json.loads(line) for line in handle if line.strip()]
+            if limit is not None and limit > 0:
+                negatives = negatives[: max(1, round(limit * 0.25))]
+            self.rows.extend(negatives)
         self.training = training
 
     def __len__(self) -> int:
@@ -67,21 +90,54 @@ class PersonEdgeDataset(Dataset):
         row = self.rows[index]
         image = Image.open(row["image"]).convert("RGB")
         human_ids = Image.open(row["human_ids"]).convert("L")
+        if "crop" in row:
+            crop = tuple(row["crop"])
+            image = image.crop(crop)
+            human_ids = human_ids.crop(crop)
+
+        # Instance maps contain IDs 0, 1, 2...; binarize before interpolation.
+        # Resizing IDs directly makes the soft boundary depend on the person's ID.
+        human_ids = human_ids.point(lambda value: 255 if value > 0 else 0, mode="L")
         if self.training:
             if random.random() < 0.5:
                 image = image.transpose(Image.Transpose.FLIP_LEFT_RIGHT)
                 human_ids = human_ids.transpose(Image.Transpose.FLIP_LEFT_RIGHT)
-            image = ImageEnhance.Brightness(image).enhance(random.uniform(0.85, 1.15))
-            image = ImageEnhance.Contrast(image).enhance(random.uniform(0.85, 1.15))
+
+            # Mild geometric changes approximate webcam framing without badly
+            # distorting the parsing mask.
+            if random.random() < 0.6:
+                width, height = image.size
+                scale = random.uniform(0.82, 1.0)
+                crop_width, crop_height = max(2, round(width * scale)), max(2, round(height * scale))
+                x0 = random.randint(0, width - crop_width)
+                y0 = random.randint(0, height - crop_height)
+                box = (x0, y0, x0 + crop_width, y0 + crop_height)
+                image = image.crop(box)
+                human_ids = human_ids.crop(box)
+            if random.random() < 0.35:
+                angle = random.uniform(-6.0, 6.0)
+                image = image.rotate(angle, resample=Image.Resampling.BICUBIC, fillcolor=(124, 116, 104))
+                human_ids = human_ids.rotate(angle, resample=Image.Resampling.BILINEAR, fillcolor=0)
+
+            image = ImageEnhance.Brightness(image).enhance(random.uniform(0.78, 1.22))
+            image = ImageEnhance.Contrast(image).enhance(random.uniform(0.78, 1.22))
+            image = ImageEnhance.Color(image).enhance(random.uniform(0.80, 1.20))
+            if random.random() < 0.25:
+                image = image.filter(ImageFilter.GaussianBlur(random.uniform(0.3, 1.2)))
+            if random.random() < 0.20:
+                buffer = io.BytesIO()
+                image.save(buffer, format="JPEG", quality=random.randint(45, 90))
+                buffer.seek(0)
+                image = Image.open(buffer).convert("RGB")
         rgb = np.asarray(image.resize((SIZE, SIZE), Image.Resampling.BILINEAR), dtype=np.float32)
+        if self.training and random.random() < 0.25:
+            rgb = np.clip(rgb + np.random.normal(0, random.uniform(2.0, 7.0), rgb.shape), 0, 255)
         source = np.empty((3, SIZE, SIZE), dtype=np.float32)
         source[0] = rgb[:, :, 2] - BGR_MEAN[0]
         source[1] = rgb[:, :, 1] - BGR_MEAN[1]
         source[2] = rgb[:, :, 0] - BGR_MEAN[2]
-        mask = np.asarray(
-            human_ids.resize((SIZE, SIZE), Image.Resampling.BILINEAR), dtype=np.float32
-        )
-        mask = np.clip(mask, 0, 1)[None]
+        mask = np.asarray(human_ids.resize((SIZE, SIZE), Image.Resampling.BILINEAR), dtype=np.float32)
+        mask = (mask / 255.0)[None]
         return torch.from_numpy(source), torch.from_numpy(mask)
 
 
@@ -110,6 +166,10 @@ def supervised_loss(logit: torch.Tensor, target: torch.Tensor, person: torch.Ten
     positive = (target > 0.10).float()
     positive_fraction = positive.mean(dim=(1, 2, 3), keepdim=True)
     weights = positive * (1 - positive_fraction) + (1 - positive) * positive_fraction * 1.1
+    # A pure background crop has no positive pixels. Give it ordinary BCE
+    # weights instead of the zero weights produced by class balancing.
+    empty = positive.flatten(1).sum(dim=1).eq(0).view(-1, 1, 1, 1)
+    weights = torch.where(empty, torch.ones_like(weights), weights)
     edge_loss = F.binary_cross_entropy_with_logits(logit, target, weight=weights)
     outside = (1 - person).clamp(0, 1)
     background_loss = (torch.sigmoid(logit) * outside).sum() / outside.sum().clamp_min(1)
@@ -175,17 +235,30 @@ def main() -> None:
     for parameter in teacher.parameters():
         parameter.requires_grad_(False)
 
-    train_set = PersonEdgeDataset(args.train_manifest, training=True, limit=args.train_limit)
-    val_set = PersonEdgeDataset(args.val_manifest, training=False, limit=args.val_limit)
+    train_set = PersonEdgeDataset(
+        args.train_manifest,
+        training=True,
+        limit=args.train_limit,
+        negative_manifest=args.train_negative_manifest,
+    )
+    val_set = PersonEdgeDataset(
+        args.val_manifest,
+        training=False,
+        limit=args.val_limit,
+        negative_manifest=args.val_negative_manifest,
+    )
     train_loader = DataLoader(
         train_set, batch_size=args.batch_size, shuffle=True, num_workers=args.workers,
-        persistent_workers=args.workers > 0,
     )
     val_loader = DataLoader(
         val_set, batch_size=args.batch_size, shuffle=False, num_workers=args.workers,
-        persistent_workers=args.workers > 0,
     )
     optimizer = torch.optim.AdamW(student.parameters(), lr=args.learning_rate, weight_decay=2e-4)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer,
+        T_max=args.epochs,
+        eta_min=args.learning_rate * 0.05,
+    )
     args.output.mkdir(parents=True, exist_ok=True)
     history: list[dict] = []
     best_loss = float("inf")
@@ -195,15 +268,22 @@ def main() -> None:
         flush=True,
     )
     for epoch in range(1, args.epochs + 1):
+        learning_rate = optimizer.param_groups[0]["lr"]
         train_metrics = run_epoch(student, teacher, train_loader, device, optimizer, args.max_steps)
         val_metrics = run_epoch(student, teacher, val_loader, device, None, args.max_steps)
-        record = {"epoch": epoch, "train": train_metrics, "validation": val_metrics}
+        record = {
+            "epoch": epoch,
+            "learning_rate": learning_rate,
+            "train": train_metrics,
+            "validation": val_metrics,
+        }
         history.append(record)
         checkpoint = args.output / f"epoch-{epoch}.pth"
         torch.save(student.state_dict(), checkpoint)
         if val_metrics["loss"] < best_loss:
             best_loss = val_metrics["loss"]
             torch.save(student.state_dict(), args.output / "best.pth")
+        scheduler.step()
         (args.output / "history.json").write_text(json.dumps(history, indent=2) + "\n")
         print(json.dumps(record), flush=True)
 
