@@ -3,26 +3,27 @@ import wasmUrl from '../node_modules/onnxruntime-web/dist/ort-wasm-simd-threaded
 import './style.css';
 
 const SIZE = 320;
+const assetUrl = (path) => `${import.meta.env.BASE_URL}${path.replace(/^\/+/, '')}`;
 // The official TEED pipeline reads OpenCV BGR pixels and subtracts the BIPED
 // training mean. Canvas gives us RGB, so preprocessing reverses R and B below.
 const BGR_MEAN = [103.939, 116.779, 123.68];
 const IMAGENET_MEAN = [0.485, 0.456, 0.406];
 const IMAGENET_STD = [0.229, 0.224, 0.225];
 const DETECTORS = {
-  teed: { label: 'TEED', url: '/teed-320.onnx', preprocessing: 'teed', normalizeMask: true, threshold: 0.35 },
-  'teed-person': { label: 'TEED Person', url: '/teed-person-320.onnx', preprocessing: 'teed', normalizeMask: true, threshold: 0.18 },
-  pidinet: { label: 'PiDiNet Small', url: '/pidinet-small-320.onnx', preprocessing: 'imagenet', normalizeMask: false, threshold: 0.35 },
+  teed: { label: 'TEED', url: 'teed-320.onnx', preprocessing: 'teed', normalizeMask: true, threshold: 0.35 },
+  'teed-person': { label: 'TEED Person', url: 'teed-person-320.onnx', preprocessing: 'teed', normalizeMask: true, threshold: 0.18 },
+  pidinet: { label: 'PiDiNet Small', url: 'pidinet-small-320.onnx', preprocessing: 'imagenet', normalizeMask: false, threshold: 0.35 },
   canny: { label: 'Canny', url: null, preprocessing: 'canny', normalizeMask: false, threshold: 0.08 }
 };
 const SEGMENTERS = {
   mediapipe: { label: 'MediaPipe landscape', backend: 'MediaPipe' },
   'rvm-fp32': {
     label: 'RVM MobileNetV3 FP32', backend: 'RVM FP32 (WASM)',
-    url: '/rvm-mobilenetv3-fp32.onnx', precision: 'float32'
+    url: 'rvm-mobilenetv3-fp32.onnx', precision: 'float32'
   },
   'rvm-fp16': {
     label: 'RVM MobileNetV3 FP16', backend: 'RVM FP16 (WASM)',
-    url: '/rvm-mobilenetv3-fp16.onnx', precision: 'float16'
+    url: 'rvm-mobilenetv3-fp16.onnx', precision: 'float16'
   }
 };
 
@@ -127,7 +128,7 @@ async function loadPersonMask() {
   if (el.segmenter.value === 'mediapipe') {
     if (!selfieSegmenter) {
       const { SelfieSegmentation } = await import('@mediapipe/selfie_segmentation');
-      selfieSegmenter = new SelfieSegmentation({ locateFile: (file) => `/mediapipe/${file}` });
+      selfieSegmenter = new SelfieSegmentation({ locateFile: (file) => assetUrl(`mediapipe/${file}`) });
       selfieSegmenter.setOptions({ modelSelection: 1, selfieMode: false });
       selfieSegmenter.onResults((results) => {
         personMaskCtx.clearRect(0, 0, SIZE, SIZE);
@@ -143,7 +144,7 @@ async function loadPersonMask() {
     const config = SEGMENTERS[el.segmenter.value];
     rvmPrecision = config.precision;
     if (!rvmSessionCache.has(el.segmenter.value)) {
-      rvmSessionCache.set(el.segmenter.value, await ort.InferenceSession.create(config.url, {
+      rvmSessionCache.set(el.segmenter.value, await ort.InferenceSession.create(assetUrl(config.url), {
         executionProviders: ['wasm'],
         graphOptimizationLevel: 'all'
       }));
@@ -216,7 +217,7 @@ async function loadDetector(detectorId) {
   try {
     if (detector.url) {
       if (!sessionCache.has(detectorId)) {
-        sessionCache.set(detectorId, await ort.InferenceSession.create(detector.url, {
+        sessionCache.set(detectorId, await ort.InferenceSession.create(assetUrl(detector.url), {
           executionProviders: providers,
           graphOptimizationLevel: 'all'
         }));

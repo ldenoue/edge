@@ -11,6 +11,8 @@ suppressing edges in the surrounding scene. Unlike the optional MediaPipe and
 RVM modes, TEED Person does this in one inference pass without first computing
 a segmentation mask.
 
+**Live demo:** [ldenoue.github.io/edge](https://ldenoue.github.io/edge/)
+
 ## Detectors and person masks
 
 | Option | Purpose | Runtime notes |
