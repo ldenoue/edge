@@ -9,7 +9,13 @@ from pathlib import Path
 import torch
 from torch.utils.data import DataLoader
 
-from train_teed_person_edges import PersonEdgeDataset, choose_device, load_teed, make_targets
+from train_teed_person_edges import (
+    PersonEdgeDataset,
+    choose_device,
+    load_teed,
+    make_targets,
+    silhouette_boundary,
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -19,13 +25,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--negative-manifest",
         type=Path,
-        default=Path("data/cihp_person_edges/validation_negatives.jsonl"),
+        nargs="+",
+        default=[Path("data/cihp_person_edges/validation_negatives.jsonl")],
     )
     parser.add_argument("--teacher", type=Path, default=Path("vendor/TEED/checkpoints/BIPED/5/5_model.pth"))
     parser.add_argument("--source", type=Path, default=Path("vendor/TEED"))
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--workers", type=int, default=0)
     parser.add_argument("--threshold", type=float, default=0.18)
+    parser.add_argument(
+        "--absolute-thresholds",
+        type=float,
+        nargs="+",
+        default=[0.46, 0.48, 0.50, 0.52, 0.54, 0.56],
+    )
     return parser.parse_args()
 
 
@@ -60,11 +73,24 @@ def main() -> None:
             "positive_background_count": 0.0,
             "positive_edge_sum": 0.0,
             "positive_edge_count": 0.0,
+            "normalized_edge_pixels": 0.0,
+            "silhouette_sum": 0.0,
+            "silhouette_count": 0.0,
+            "normalized_silhouette_pixels": 0.0,
             "normalized_background_pixels": 0.0,
             "normalized_background_count": 0.0,
             "negative_sum": 0.0,
             "negative_count": 0.0,
             "normalized_negative_pixels": 0.0,
+            "absolute": {
+                threshold: {
+                    "edge": 0.0,
+                    "silhouette": 0.0,
+                    "positive_background": 0.0,
+                    "negative": 0.0,
+                }
+                for threshold in args.absolute_thresholds
+            },
         }
         for name in models
     }
@@ -73,6 +99,7 @@ def main() -> None:
         for images, person in loader:
             images, person = images.to(device), person.to(device)
             target = make_targets(teacher, images, person) if kind == "positive" else None
+            boundary = silhouette_boundary(person) if kind == "positive" else None
             for name, model in models.items():
                 prediction = torch.sigmoid(model(images)[-1])
                 visible = normalized(prediction) > args.threshold
@@ -84,12 +111,33 @@ def main() -> None:
                     metrics["positive_background_count"] += float(outside.sum().cpu())
                     metrics["positive_edge_sum"] += float((prediction * edges).sum().cpu())
                     metrics["positive_edge_count"] += float(edges.sum().cpu())
-                    metrics["normalized_background_pixels"] += float((visible * outside.bool()).sum().cpu())
+                    metrics["normalized_edge_pixels"] += float((visible * edges.bool()).sum().cpu())
+                    metrics["silhouette_sum"] += float((prediction * boundary).sum().cpu())
+                    metrics["silhouette_count"] += float(boundary.sum().cpu())
+                    metrics["normalized_silhouette_pixels"] += float(
+                        (visible * boundary).sum().cpu()
+                    )
+                    metrics["normalized_background_pixels"] += float((visible * outside).sum().cpu())
                     metrics["normalized_background_count"] += float(outside.sum().cpu())
+                    for threshold in args.absolute_thresholds:
+                        above = prediction > threshold
+                        metrics["absolute"][threshold]["edge"] += float(
+                            (above * edges.bool()).sum().cpu()
+                        )
+                        metrics["absolute"][threshold]["silhouette"] += float(
+                            (above * boundary).sum().cpu()
+                        )
+                        metrics["absolute"][threshold]["positive_background"] += float(
+                            (above * outside).sum().cpu()
+                        )
                 else:
                     metrics["negative_sum"] += float(prediction.sum().cpu())
                     metrics["negative_count"] += prediction.numel()
                     metrics["normalized_negative_pixels"] += float(visible.sum().cpu())
+                    for threshold in args.absolute_thresholds:
+                        metrics["absolute"][threshold]["negative"] += float(
+                            (prediction > threshold).sum().cpu()
+                        )
 
     report = {}
     for name, metrics in totals.items():
@@ -97,11 +145,26 @@ def main() -> None:
             "positive_background_response": metrics["positive_background_sum"]
             / metrics["positive_background_count"],
             "positive_edge_response": metrics["positive_edge_sum"] / metrics["positive_edge_count"],
+            "visible_person_edge_recall": metrics["normalized_edge_pixels"]
+            / metrics["positive_edge_count"],
+            "silhouette_response": metrics["silhouette_sum"] / metrics["silhouette_count"],
+            "visible_silhouette_recall": metrics["normalized_silhouette_pixels"]
+            / metrics["silhouette_count"],
             "visible_background_fraction": metrics["normalized_background_pixels"]
             / metrics["normalized_background_count"],
             "negative_response": metrics["negative_sum"] / metrics["negative_count"],
             "visible_negative_fraction": metrics["normalized_negative_pixels"]
             / metrics["negative_count"],
+            "absolute_thresholds": {
+                str(threshold): {
+                    "person_edge_recall": values["edge"] / metrics["positive_edge_count"],
+                    "silhouette_recall": values["silhouette"] / metrics["silhouette_count"],
+                    "positive_background_fraction": values["positive_background"]
+                    / metrics["positive_background_count"],
+                    "negative_fraction": values["negative"] / metrics["negative_count"],
+                }
+                for threshold, values in metrics["absolute"].items()
+            },
         }
     print(json.dumps({"device": str(device), "threshold": args.threshold, "models": report}, indent=2))
 

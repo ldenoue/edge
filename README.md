@@ -6,10 +6,10 @@ over the original full-resolution frame. Neural models use ONNX Runtime Web with
 WebGPU where possible; frames never leave the browser.
 
 The main experiment is **TEED Person**: a 243 KiB TEED model fine-tuned to
-retain human silhouettes and interior clothing/face/limb detail while
-suppressing edges in the surrounding scene. Unlike the optional MediaPipe and
-RVM modes, TEED Person does this in one inference pass without first computing
-a segmentation mask.
+find a person directly, without first running a segmentation model. V3 makes
+the person/background silhouette the primary signal, keeps internal clothing,
+face, and limb edges at lower weight, and learns from real no-person frames so
+that surrounding scene edges are less likely to appear.
 
 **Live demo:** [ldenoue.github.io/edge](https://ldenoue.github.io/edge/)
 
@@ -18,6 +18,7 @@ a segmentation mask.
 | Option | Purpose | Runtime notes |
 | --- | --- | --- |
 | TEED | General semantic edges | 320×320 ONNX; WebGPU with WASM fallback |
+| TEED Person V3 Silhouette | Prioritizes the person/background contour and suppresses scene edges | Absolute calibrated output; default threshold `0.56` |
 | TEED Person V2 | Human-prioritized edges with corrected masks and hard negatives | Same 243 KiB architecture as TEED |
 | TEED Person V1 | Original three-epoch person experiment | Kept for direct A/B comparison |
 | PiDiNet Small | Fewer, heavier perceptual boundaries | 320×320 ONNX |
@@ -143,7 +144,48 @@ The positive manifests are `training.jsonl` and `validation.jsonl`; hard
 negatives are written separately as `training_negatives.jsonl` and
 `validation_negatives.jsonl`. Use `--negative-ratio 0` to disable them.
 
-### How TEED Person was trained
+### Prepare full-frame COCO negatives
+
+CIHP background crops are useful hard negatives, but they do not teach the
+model what an entire frame with no person looks like. V3 also uses images from
+the COCO 2017 validation split whose instance annotations contain no `person`
+category. COCO is described on the official
+[dataset page](https://cocodataset.org/dataset/detection-2017.htm). The images
+are downloaded selectively rather than fetching the complete dataset.
+
+Download the compact instance annotation file and verify the exact file used
+for this experiment:
+
+```bash
+mkdir -p data/coco/annotations
+curl -L \
+  https://huggingface.co/datasets/pcuenq/coco2017-instances/resolve/main/instances_val2017.json \
+  -o data/coco/annotations/instances_val2017.json
+echo "e8c7f7908f1d7278341fae127d0da654f102f11bd7b21d8aeefa635b8c810b6f  data/coco/annotations/instances_val2017.json" \
+  | shasum -a 256 -c -
+```
+
+Then reproduce the V3 negative manifests:
+
+```bash
+python3 scripts/prepare_coco_negatives.py \
+  --annotations data/coco/annotations/instances_val2017.json \
+  --output data/coco_no_person \
+  --train-count 1200 --val-count 300 \
+  --candidate-multiplier 1.5 --seed 1021 \
+  --download-missing --download-workers 12
+```
+
+The script found 2,307 images without an annotated person, downloaded and
+texture-scored a deterministic pool of 2,250, then retained 1,200 training and
+300 validation images. Texture score is grayscale gradient energy plus
+`0.15 ×` intensity standard deviation, which favors challenging structured
+scenes over blank walls and sky. “No annotated person” is not a proof that no
+human is visible, so visually audit contact sheets or random samples when
+rebuilding the dataset. Images, annotations, and generated manifests are
+ignored by Git.
+
+### How TEED Person V1 and V2 were trained
 
 The source data is the CIHP instance-level human-parsing dataset. Its training
 set is intentionally crowded, so selection happens per annotated person rather
@@ -211,12 +253,83 @@ Checkpoints, manifests, cached targets, the TEED checkout, and `dist/` are
 intentionally ignored by Git. The exported ONNX files under `public/` are the
 small deployable artifacts that belong in version control.
 
+### Train the silhouette-prioritized V3 model
+
+V3 starts from the V2 checkpoint but keeps the stock BIPED model as the frozen
+teacher. It mixes CIHP background crops with full-frame COCO no-person images,
+then deterministically caps the combined training negatives at 1,200 so they
+do not overwhelm the 4,106 positive images.
+
+The target reflects this project's priority: the person/background boundary is
+full strength, while teacher-derived edges inside a person are only one quarter
+strength:
+
+```text
+target = max(
+  0.25 × normalized_teacher_edges × soft_union_of_human_masks,
+  human_silhouette_boundary
+)
+```
+
+Silhouette pixels receive an additional `3 ×` BCE weight (four times the base
+pixel weight in total). Background suppression remains at `0.5`; this avoids
+the over-suppression observed in early V3 trials while still teaching blank
+person masks. Reproduce the selected run with:
+
+```bash
+python3 scripts/train_teed_person_edges.py \
+  --epochs 6 --batch-size 16 --workers 4 --learning-rate 2e-5 \
+  --checkpoint checkpoints/teed_person_v2/best.pth \
+  --teacher-checkpoint vendor/TEED/checkpoints/BIPED/5/5_model.pth \
+  --background-weight 0.5 --interior-edge-weight 0.25 \
+  --boundary-loss-weight 3 \
+  --train-negative-manifest \
+    data/cihp_person_edges/training_negatives.jsonl \
+    data/coco_no_person/training.jsonl \
+  --val-negative-manifest \
+    data/cihp_person_edges/validation_negatives.jsonl \
+    data/coco_no_person/validation.jsonl \
+  --train-negative-limit 1200 \
+  --output checkpoints/teed_person_v3_silhouette
+```
+
+Epoch 3 was selected by the silhouette-focused validation comparison, rather
+than copying `best.pth`, which is selected by the broader aggregate loss.
+Evaluate and export that checkpoint with:
+
+```bash
+python3 scripts/evaluate_teed_person_edges.py \
+  checkpoints/teed_person_v2/best.pth \
+  checkpoints/teed_person_v3_silhouette/epoch-3.pth \
+  --negative-manifest \
+    data/cihp_person_edges/validation_negatives.jsonl \
+    data/coco_no_person/validation.jsonl
+python3 scripts/convert_teed.py \
+  checkpoints/teed_person_v3_silhouette/epoch-3.pth \
+  public/teed-person-v3-320.onnx --source vendor/TEED --size 320
+npm run build
+```
+
+At matched positive-image background leakage of about 4.95%, V2 at absolute
+threshold `0.46` reached 41.98% visible-silhouette recall and 4.24% active
+pixels on full no-person frames. V3 at threshold `0.56` reached 42.52%
+visible-silhouette recall and 3.70% on no-person frames. Its lower interior-edge
+recall is deliberate: capacity and loss weight were shifted toward the outer
+human contour.
+
+Unlike V1/V2 and stock TEED, V3 does not apply per-frame min/max normalization
+in the browser. It uses the raw sigmoid output and an absolute default threshold
+of `0.56`, preserving the model's learned confidence so a weak no-person frame
+cannot be stretched into visible edges.
+
 Open the printed localhost URL. Drop a browser-supported video onto the stage or
 select **Use webcam**. Webcam access works on localhost or HTTPS.
 
 Use the detector picker to compare:
 
 - **TEED** — the fastest neural option and the default.
+- **TEED Person V3 Silhouette** — emphasizes the outer person contour and uses
+  calibrated confidence to suppress no-person scenes.
 - **TEED Person V2** — corrected masks, hard negatives, and stronger augmentation.
 - **TEED Person V1** — the original model, retained for A/B comparison.
 - **PiDiNet Small** — more detailed perceptual boundaries with a larger runtime cost.

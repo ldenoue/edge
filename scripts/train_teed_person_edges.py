@@ -28,26 +28,58 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--train-negative-manifest",
         type=Path,
-        default=Path("data/cihp_person_edges/training_negatives.jsonl"),
+        nargs="+",
+        default=[Path("data/cihp_person_edges/training_negatives.jsonl")],
     )
     parser.add_argument(
         "--val-negative-manifest",
         type=Path,
-        default=Path("data/cihp_person_edges/validation_negatives.jsonl"),
+        nargs="+",
+        default=[Path("data/cihp_person_edges/validation_negatives.jsonl")],
     )
     parser.add_argument("--source", type=Path, default=Path("vendor/TEED"))
     parser.add_argument(
         "--checkpoint",
         type=Path,
         default=Path("vendor/TEED/checkpoints/BIPED/5/5_model.pth"),
+        help="Student initialization; use a prior person checkpoint for continued fine-tuning.",
+    )
+    parser.add_argument(
+        "--teacher-checkpoint",
+        type=Path,
+        default=Path("vendor/TEED/checkpoints/BIPED/5/5_model.pth"),
+        help="Frozen general-edge teacher used to create targets.",
     )
     parser.add_argument("--output", type=Path, default=Path("checkpoints/teed_person"))
     parser.add_argument("--epochs", type=int, default=3)
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--learning-rate", type=float, default=1e-4)
+    parser.add_argument("--background-weight", type=float, default=0.5)
+    parser.add_argument(
+        "--interior-edge-weight",
+        type=float,
+        default=1.0,
+        help="Scale teacher edges inside people while keeping the silhouette target at full strength.",
+    )
+    parser.add_argument(
+        "--boundary-loss-weight",
+        type=float,
+        default=0.0,
+        help="Additional BCE weight on the person/background silhouette band.",
+    )
     parser.add_argument("--workers", type=int, default=2)
     parser.add_argument("--train-limit", type=int)
     parser.add_argument("--val-limit", type=int)
+    parser.add_argument(
+        "--train-negative-limit",
+        type=int,
+        help="Deterministically cap combined training negatives after loading all manifests.",
+    )
+    parser.add_argument(
+        "--val-negative-limit",
+        type=int,
+        help="Deterministically cap combined validation negatives.",
+    )
     parser.add_argument("--max-steps", type=int, help="Stop each epoch early; useful for smoke tests.")
     parser.add_argument("--seed", type=int, default=1021)
     return parser.parse_args()
@@ -69,15 +101,27 @@ class PersonEdgeDataset(Dataset):
         manifest: Path,
         training: bool,
         limit: int | None = None,
-        negative_manifest: Path | None = None,
+        negative_manifest: list[Path] | Path | None = None,
+        negative_limit: int | None = None,
+        seed: int = 1021,
     ):
         with manifest.open(encoding="utf-8") as handle:
             self.rows = [json.loads(line) for line in handle if line.strip()]
         if limit is not None:
             self.rows = self.rows[:limit]
-        if negative_manifest is not None and negative_manifest.exists():
-            with negative_manifest.open(encoding="utf-8") as handle:
-                negatives = [json.loads(line) for line in handle if line.strip()]
+        negative_manifests = (
+            [negative_manifest] if isinstance(negative_manifest, Path) else negative_manifest or []
+        )
+        negatives = []
+        for path in negative_manifests:
+            if not path.exists():
+                continue
+            with path.open(encoding="utf-8") as handle:
+                negatives.extend(json.loads(line) for line in handle if line.strip())
+        if negatives:
+            random.Random(seed).shuffle(negatives)
+            if negative_limit is not None:
+                negatives = negatives[:negative_limit]
             if limit is not None and limit > 0:
                 negatives = negatives[: max(1, round(limit * 0.25))]
             self.rows.extend(negatives)
@@ -89,7 +133,11 @@ class PersonEdgeDataset(Dataset):
     def __getitem__(self, index: int) -> tuple[torch.Tensor, torch.Tensor]:
         row = self.rows[index]
         image = Image.open(row["image"]).convert("RGB")
-        human_ids = Image.open(row["human_ids"]).convert("L")
+        human_ids = (
+            Image.open(row["human_ids"]).convert("L")
+            if row.get("human_ids")
+            else Image.new("L", image.size, 0)
+        )
         if "crop" in row:
             crop = tuple(row["crop"])
             image = image.crop(crop)
@@ -149,20 +197,36 @@ def choose_device() -> torch.device:
     return torch.device("cpu")
 
 
+def silhouette_boundary(person: torch.Tensor) -> torch.Tensor:
+    binary = (person > 0.5).float()
+    dilated = F.max_pool2d(binary, 5, stride=1, padding=2)
+    eroded = -F.max_pool2d(-binary, 5, stride=1, padding=2)
+    return F.avg_pool2d((dilated - eroded).clamp(0, 1), 3, stride=1, padding=1)
+
+
 @torch.no_grad()
-def make_targets(teacher, images: torch.Tensor, person: torch.Tensor) -> torch.Tensor:
+def make_targets(
+    teacher,
+    images: torch.Tensor,
+    person: torch.Tensor,
+    interior_edge_weight: float = 1.0,
+) -> torch.Tensor:
     edge = torch.sigmoid(teacher(images)[-1])
     edge_min = edge.amin(dim=(2, 3), keepdim=True)
     edge_max = edge.amax(dim=(2, 3), keepdim=True)
     edge = (edge - edge_min) / (edge_max - edge_min).clamp_min(1e-6)
-    binary = (person > 0.5).float()
-    dilated = F.max_pool2d(binary, 5, stride=1, padding=2)
-    eroded = -F.max_pool2d(-binary, 5, stride=1, padding=2)
-    boundary = F.avg_pool2d((dilated - eroded).clamp(0, 1), 3, stride=1, padding=1)
-    return torch.maximum(edge * person, boundary)
+    boundary = silhouette_boundary(person)
+    return torch.maximum(edge * person * interior_edge_weight, boundary)
 
 
-def supervised_loss(logit: torch.Tensor, target: torch.Tensor, person: torch.Tensor) -> torch.Tensor:
+def supervised_loss(
+    logit: torch.Tensor,
+    target: torch.Tensor,
+    person: torch.Tensor,
+    background_weight: float,
+    boundary: torch.Tensor,
+    boundary_loss_weight: float,
+) -> torch.Tensor:
     positive = (target > 0.10).float()
     positive_fraction = positive.mean(dim=(1, 2, 3), keepdim=True)
     weights = positive * (1 - positive_fraction) + (1 - positive) * positive_fraction * 1.1
@@ -170,10 +234,11 @@ def supervised_loss(logit: torch.Tensor, target: torch.Tensor, person: torch.Ten
     # weights instead of the zero weights produced by class balancing.
     empty = positive.flatten(1).sum(dim=1).eq(0).view(-1, 1, 1, 1)
     weights = torch.where(empty, torch.ones_like(weights), weights)
+    weights = weights * (1 + boundary_loss_weight * boundary)
     edge_loss = F.binary_cross_entropy_with_logits(logit, target, weight=weights)
     outside = (1 - person).clamp(0, 1)
     background_loss = (torch.sigmoid(logit) * outside).sum() / outside.sum().clamp_min(1)
-    return edge_loss + 0.5 * background_loss
+    return edge_loss + background_weight * background_loss
 
 
 def run_epoch(
@@ -183,18 +248,32 @@ def run_epoch(
     device: torch.device,
     optimizer: torch.optim.Optimizer | None,
     max_steps: int | None,
+    background_weight: float,
+    interior_edge_weight: float,
+    boundary_loss_weight: float,
 ) -> dict[str, float]:
     training = optimizer is not None
     student.train(training)
-    totals = {"loss": 0.0, "background": 0.0, "edge_response": 0.0}
+    totals = {"loss": 0.0, "background": 0.0, "edge_response": 0.0, "boundary_response": 0.0}
     steps = 0
     for step, (images, person) in enumerate(loader, 1):
         images = images.to(device)
         person = person.to(device)
-        target = make_targets(teacher, images, person)
+        boundary = silhouette_boundary(person)
+        target = make_targets(teacher, images, person, interior_edge_weight)
         with torch.set_grad_enabled(training):
             outputs = student(images)
-            losses = [supervised_loss(output, target, person) for output in outputs]
+            losses = [
+                supervised_loss(
+                    output,
+                    target,
+                    person,
+                    background_weight,
+                    boundary,
+                    boundary_loss_weight,
+                )
+                for output in outputs
+            ]
             loss = sum(losses[:-1]) * 0.25 + losses[-1]
             if training:
                 optimizer.zero_grad(set_to_none=True)
@@ -212,6 +291,9 @@ def run_epoch(
             totals["edge_response"] += float(
                 ((prediction * edge_pixels).sum() / edge_pixels.sum().clamp_min(1)).detach().cpu()
             )
+            totals["boundary_response"] += float(
+                ((prediction * boundary).sum() / boundary.sum().clamp_min(1)).detach().cpu()
+            )
         steps += 1
         if training and step % 50 == 0:
             print(f"step {step}/{len(loader)} loss={totals['loss'] / steps:.4f}", flush=True)
@@ -227,11 +309,12 @@ def main() -> None:
     torch.manual_seed(args.seed)
     device = choose_device()
     TED = load_teed(args.source)
-    state = torch.load(args.checkpoint, map_location="cpu", weights_only=True)
+    teacher_state = torch.load(args.teacher_checkpoint, map_location="cpu", weights_only=True)
+    student_state = torch.load(args.checkpoint, map_location="cpu", weights_only=True)
     teacher = TED().to(device).eval()
     student = TED().to(device)
-    teacher.load_state_dict(state, strict=True)
-    student.load_state_dict(state, strict=True)
+    teacher.load_state_dict(teacher_state, strict=True)
+    student.load_state_dict(student_state, strict=True)
     for parameter in teacher.parameters():
         parameter.requires_grad_(False)
 
@@ -240,12 +323,16 @@ def main() -> None:
         training=True,
         limit=args.train_limit,
         negative_manifest=args.train_negative_manifest,
+        negative_limit=args.train_negative_limit,
+        seed=args.seed,
     )
     val_set = PersonEdgeDataset(
         args.val_manifest,
         training=False,
         limit=args.val_limit,
         negative_manifest=args.val_negative_manifest,
+        negative_limit=args.val_negative_limit,
+        seed=args.seed + 1,
     )
     train_loader = DataLoader(
         train_set, batch_size=args.batch_size, shuffle=True, num_workers=args.workers,
@@ -269,8 +356,28 @@ def main() -> None:
     )
     for epoch in range(1, args.epochs + 1):
         learning_rate = optimizer.param_groups[0]["lr"]
-        train_metrics = run_epoch(student, teacher, train_loader, device, optimizer, args.max_steps)
-        val_metrics = run_epoch(student, teacher, val_loader, device, None, args.max_steps)
+        train_metrics = run_epoch(
+            student,
+            teacher,
+            train_loader,
+            device,
+            optimizer,
+            args.max_steps,
+            args.background_weight,
+            args.interior_edge_weight,
+            args.boundary_loss_weight,
+        )
+        val_metrics = run_epoch(
+            student,
+            teacher,
+            val_loader,
+            device,
+            None,
+            args.max_steps,
+            args.background_weight,
+            args.interior_edge_weight,
+            args.boundary_loss_weight,
+        )
         record = {
             "epoch": epoch,
             "learning_rate": learning_rate,
