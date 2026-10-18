@@ -19,6 +19,9 @@ const DETECTORS = {
   canny: { label: 'Canny', url: null, preprocessing: 'canny', normalizeMask: false, threshold: 0.08 }
 };
 const SEGMENTERS = {
+  'mediapipe-multiclass': {
+    label: 'MediaPipe multiclass fast 256 × 256', backend: 'MediaPipe multiclass'
+  },
   mediapipe: { label: 'MediaPipe landscape', backend: 'MediaPipe' },
   'rvm-fp32': {
     label: 'RVM MobileNetV3 FP32', backend: 'RVM FP32 (WASM)',
@@ -46,6 +49,9 @@ const frameCtx = el.frameCanvas.getContext('2d');
 const personLayerCtx = el.personLayer.getContext('2d');
 let session;
 let selfieSegmenter;
+let multiclassSegmenter;
+let multiclassBackgroundIndex = 0;
+let multiclassGpuCanvas;
 let rvmSession;
 let rvmStates;
 let rvmPrecision = 'float32';
@@ -95,6 +101,45 @@ function applyPersonMask(mask) {
   latestPersonMask = mask;
 }
 
+function resizePersonMask(source, sourceWidth, sourceHeight) {
+  if (sourceWidth === SIZE && sourceHeight === SIZE) return Float32Array.from(source);
+  const output = new Float32Array(SIZE * SIZE);
+  const xScale = sourceWidth / SIZE;
+  const yScale = sourceHeight / SIZE;
+  for (let y = 0; y < SIZE; y += 1) {
+    const sourceY = Math.max(0, Math.min(sourceHeight - 1, (y + 0.5) * yScale - 0.5));
+    const y0 = Math.floor(sourceY);
+    const y1 = Math.min(sourceHeight - 1, y0 + 1);
+    const yWeight = sourceY - y0;
+    for (let x = 0; x < SIZE; x += 1) {
+      const sourceX = Math.max(0, Math.min(sourceWidth - 1, (x + 0.5) * xScale - 0.5));
+      const x0 = Math.floor(sourceX);
+      const x1 = Math.min(sourceWidth - 1, x0 + 1);
+      const xWeight = sourceX - x0;
+      const top = source[y0 * sourceWidth + x0] * (1 - xWeight)
+        + source[y0 * sourceWidth + x1] * xWeight;
+      const bottom = source[y1 * sourceWidth + x0] * (1 - xWeight)
+        + source[y1 * sourceWidth + x1] * xWeight;
+      output[y * SIZE + x] = top * (1 - yWeight) + bottom * yWeight;
+    }
+  }
+  return output;
+}
+
+function runMulticlassSegmentation() {
+  multiclassSegmenter.segmentForVideo(el.modelInput, performance.now(), (result) => {
+    const masks = result.confidenceMasks;
+    if (!masks?.length || !masks[multiclassBackgroundIndex]) {
+      throw new Error('MediaPipe multiclass returned no background confidence mask');
+    }
+    const backgroundMask = masks[multiclassBackgroundIndex];
+    const background = backgroundMask.getAsFloat32Array();
+    const person = new Float32Array(background.length);
+    for (let i = 0; i < background.length; i += 1) person[i] = 1 - background[i];
+    applyPersonMask(resizePersonMask(person, backgroundMask.width, backgroundMask.height));
+  });
+}
+
 function resetRvmState() {
   rvmStates?.forEach((state) => state.dispose?.());
   const data = rvmPrecision === 'float16' ? new Uint16Array(1) : new Float32Array(1);
@@ -128,7 +173,43 @@ function float16ToFloat32(value) {
 
 async function loadPersonMask() {
   personMaskReady = false;
-  if (el.segmenter.value === 'mediapipe') {
+  if (el.segmenter.value === 'mediapipe-multiclass') {
+    if (!multiclassSegmenter) {
+      const { FilesetResolver, ImageSegmenter } = await import('@mediapipe/tasks-vision');
+      // Tasks Vision injects its WASM loader as a classic script. The module
+      // loader uses import.meta and therefore cannot run in that context.
+      const vision = await FilesetResolver.forVisionTasks(assetUrl('mediapipe/tasks-vision'));
+      const options = {
+        baseOptions: {
+          modelAssetPath: assetUrl('mediapipe/selfie_multiclass_256x256.tflite')
+        },
+        runningMode: 'VIDEO',
+        outputConfidenceMasks: true,
+        outputCategoryMask: false
+      };
+      try {
+        multiclassGpuCanvas = document.createElement('canvas');
+        multiclassSegmenter = await ImageSegmenter.createFromOptions(vision, {
+          ...options,
+          baseOptions: { ...options.baseOptions, delegate: 'GPU' },
+          canvas: multiclassGpuCanvas
+        });
+        SEGMENTERS['mediapipe-multiclass'].backend = 'MediaPipe multiclass GPU';
+      } catch (error) {
+        console.warn('MediaPipe multiclass GPU initialization failed; using CPU.', error);
+        multiclassGpuCanvas = undefined;
+        multiclassSegmenter = await ImageSegmenter.createFromOptions(vision, {
+          ...options,
+          baseOptions: { ...options.baseOptions, delegate: 'CPU' }
+        });
+        SEGMENTERS['mediapipe-multiclass'].backend = 'MediaPipe multiclass CPU';
+      }
+      const labels = multiclassSegmenter.getLabels();
+      const backgroundIndex = labels.findIndex((label) => label.toLowerCase() === 'background');
+      multiclassBackgroundIndex = backgroundIndex >= 0 ? backgroundIndex : 0;
+      console.info('MediaPipe multiclass labels:', labels);
+    }
+  } else if (el.segmenter.value === 'mediapipe') {
     if (!selfieSegmenter) {
       const { SelfieSegmentation } = await import('@mediapipe/selfie_segmentation');
       selfieSegmenter = new SelfieSegmentation({ locateFile: (file) => assetUrl(`mediapipe/${file}`) });
@@ -547,7 +628,9 @@ async function processFrame(now) {
     const usePersonMask = el.personMask.checked && personMaskReady;
     if (usePersonMask) {
       latestPersonMask = undefined;
-      if (el.segmenter.value === 'mediapipe') {
+      if (el.segmenter.value === 'mediapipe-multiclass') {
+        runMulticlassSegmentation();
+      } else if (el.segmenter.value === 'mediapipe') {
         await selfieSegmenter.send({ image: el.modelInput });
       } else {
         // RVM carries information between adjacent frames. A loop or backward
@@ -640,6 +723,9 @@ el.personMask.addEventListener('change', async () => {
     console.error(error);
     personMaskReady = false;
     selfieSegmenter = undefined;
+    multiclassSegmenter?.close();
+    multiclassSegmenter = undefined;
+    multiclassGpuCanvas = undefined;
     el.personMask.checked = false;
     el.personThreshold.disabled = true;
     updateBackend();

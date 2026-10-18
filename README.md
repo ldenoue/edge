@@ -25,13 +25,20 @@ with synthetic full-body people composited into held-out room scenes.
 | TEED Person V1 | Original three-epoch person experiment | Kept for direct A/B comparison |
 | PiDiNet Small | Fewer, heavier perceptual boundaries | 320×320 ONNX |
 | Canny | Classical image edges | Plain JavaScript |
-| MediaPipe | Optional person-mask gate | Landscape selfie-segmentation model |
+| MediaPipe Multiclass | Default optional person-mask gate | 256×256 multiclass Image Segmenter; GPU with CPU fallback |
+| MediaPipe Landscape | Faster legacy person-mask gate | 256×144 binary selfie-segmentation model |
 | RVM MobileNetV3 | Optional temporally recurrent matte | FP32 or FP16 ONNX; forced to WASM for correctness |
 
-Enable **Person only** to run MediaPipe Selfie Segmentation on the same frame
-and suppress edge pixels outside its soft person mask. The segmenter is loaded
-only when the toggle is enabled, and its model/runtime assets are served locally
-from `public/mediapipe`.
+Enable **Person only** to run the selected segmentation model on the same frame
+and suppress edge pixels outside its soft person mask. The first picker option
+uses MediaPipe's official `selfie_multiclass_256x256` model. It converts the
+background confidence into one person mask, so hair, face/body skin, clothes,
+and the rest of the segmented person remain inside the gate. MediaPipe Tasks
+runs in video mode with GPU delegation and a CPU fallback; its 256×256 output
+is bilinearly aligned to the detector's 320×320 grid. The legacy landscape model and both RVM variants
+remain available for direct comparison. Segmenters load only when the toggle is
+enabled, and their model/runtime assets are served locally from
+`public/mediapipe`.
 
 Choose **Person mask · green screen** to inspect the segmentation directly: the
 captured person is composited over green while the gated edge result stays on

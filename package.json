@@ -10,6 +10,7 @@
   },
   "dependencies": {
     "@mediapipe/selfie_segmentation": "^0.1.1675465747",
+    "@mediapipe/tasks-vision": "^1.1.1",
     "onnxruntime-web": "^1.23.2"
   },
   "devDependencies": {
