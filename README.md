@@ -45,6 +45,11 @@ captured person is composited over green while the gated edge result stays on
 top. Edge inference, segmentation, and compositing all use one frozen video
 frame to prevent temporal drift.
 
+Choose **Line mask + filled person** to inspect the soft matte together with the
+edge detector. It renders the feathered person mask as an opaque white fill over
+black, then draws the gated near-black ink lines on top. This effect
+automatically enables **Person only** when selected.
+
 The **Mask threshold** control adjusts the center of a softly feathered person
 cutoff. Raise it to reject uncertain background pixels; lower it to retain more
 hair and fine limbs. Its default of `0.33` preserves the original cutoff.

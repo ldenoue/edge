@@ -538,6 +538,8 @@ function render(mask, normalizeMask, personMask = null) {
   const strength = Number(el.strength.value);
   const color = hexToRgb(el.color.value);
   const effect = el.effect.value;
+  const isLineMask = effect === 'mask' || effect === 'mask-filled';
+  const lineMaskColor = effect === 'mask-filled' ? [3, 5, 7] : [255, 255, 255];
   const pixels = maskCtx.createImageData(SIZE, SIZE);
 
   // TEED's official inference code min/max normalizes every fused edge map.
@@ -561,10 +563,10 @@ function render(mask, normalizeMask, personMask = null) {
     // suppressing edges confidently classified as background.
     const personGate = personMask ? getPersonGate(personMask[i]) : 1;
     const alpha = Math.round(255 * confidence * strength * personGate);
-    if (effect === 'mask') {
-      pixels.data[p] = 255;
-      pixels.data[p + 1] = 255;
-      pixels.data[p + 2] = 255;
+    if (isLineMask) {
+      pixels.data[p] = lineMaskColor[0];
+      pixels.data[p + 1] = lineMaskColor[1];
+      pixels.data[p + 2] = lineMaskColor[2];
       pixels.data[p + 3] = Math.max(alpha, 10);
     } else if (effect === 'ink') {
       pixels.data[p] = 3;
@@ -581,9 +583,18 @@ function render(mask, normalizeMask, personMask = null) {
 
   maskCtx.putImageData(pixels, 0, 0);
   outputCtx.clearRect(0, 0, el.output.width, el.output.height);
-  if (effect === 'mask') {
+  if (isLineMask) {
     outputCtx.fillStyle = '#050607';
     outputCtx.fillRect(0, 0, el.output.width, el.output.height);
+    if (effect === 'mask-filled' && personMask) {
+      outputCtx.drawImage(
+        el.personMaskCanvas,
+        0,
+        0,
+        el.output.width,
+        el.output.height
+      );
+    }
   } else if (effect === 'person-debug') {
     outputCtx.fillStyle = '#00b140';
     outputCtx.fillRect(0, 0, el.output.width, el.output.height);
@@ -700,7 +711,8 @@ el.segmenter.addEventListener('change', async () => {
   }
 });
 el.effect.addEventListener('change', () => {
-  if (el.effect.value === 'person-debug' && !el.personMask.checked) {
+  const needsPersonMask = el.effect.value === 'person-debug' || el.effect.value === 'mask-filled';
+  if (needsPersonMask && !el.personMask.checked) {
     el.personMask.checked = true;
     el.personMask.dispatchEvent(new Event('change'));
   }
