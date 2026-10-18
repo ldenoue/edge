@@ -11,6 +11,7 @@ const IMAGENET_MEAN = [0.485, 0.456, 0.406];
 const IMAGENET_STD = [0.229, 0.224, 0.225];
 const DETECTORS = {
   teed: { label: 'TEED', url: 'teed-320.onnx', preprocessing: 'teed', normalizeMask: true, threshold: 0.35 },
+  'teed-person-v4': { label: 'TEED Person V4 Synthetic', url: 'teed-person-v4-320.onnx', preprocessing: 'teed', normalizeMask: false, threshold: 0.46 },
   'teed-person-v3': { label: 'TEED Person V3 Silhouette', url: 'teed-person-v3-320.onnx', preprocessing: 'teed', normalizeMask: false, threshold: 0.56 },
   'teed-person-v2': { label: 'TEED Person V2', url: 'teed-person-v2-320.onnx', preprocessing: 'teed', normalizeMask: true, threshold: 0.18 },
   'teed-person': { label: 'TEED Person V1', url: 'teed-person-320.onnx', preprocessing: 'teed', normalizeMask: true, threshold: 0.18 },

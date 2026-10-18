@@ -9,7 +9,8 @@ The main experiment is **TEED Person**: a 243 KiB TEED model fine-tuned to
 find a person directly, without first running a segmentation model. V3 makes
 the person/background silhouette the primary signal, keeps internal clothing,
 face, and limb edges at lower weight, and learns from real no-person frames so
-that surrounding scene edges are less likely to appear.
+that surrounding scene edges are less likely to appear. V4 continues from V3
+with synthetic full-body people composited into held-out room scenes.
 
 **Live demo:** [ldenoue.github.io/edge](https://ldenoue.github.io/edge/)
 
@@ -18,6 +19,7 @@ that surrounding scene edges are less likely to appear.
 | Option | Purpose | Runtime notes |
 | --- | --- | --- |
 | TEED | General semantic edges | 320×320 ONNX; WebGPU with WASM fallback |
+| TEED Person V4 Synthetic | Stronger full-body silhouette response from synthetic people in rooms | Absolute calibrated output; default threshold `0.46` |
 | TEED Person V3 Silhouette | Prioritizes the person/background contour and suppresses scene edges | Absolute calibrated output; default threshold `0.56` |
 | TEED Person V2 | Human-prioritized edges with corrected masks and hard negatives | Same 243 KiB architecture as TEED |
 | TEED Person V1 | Original three-epoch person experiment | Kept for direct A/B comparison |
@@ -322,12 +324,98 @@ in the browser. It uses the raw sigmoid output and an absolute default threshold
 of `0.56`, preserving the model's learned confidence so a weak no-person frame
 cannot be stretched into visible edges.
 
+### Generate synthetic full-body data for V4
+
+V4 experiments add paired renders made with Blender, MPFB's rigged MakeHuman
+body, and curated room photos. The RGB image and person mask use the exact same
+camera and pose. Shape, skin tone, painted garment colors, pose, framing, room
+crop, and lighting are randomized deterministically. Temporary Blender meshes,
+materials, and image textures are removed after every frame so long runs do not
+continually grow in memory.
+
+The room backgrounds come from Pixabay's `room` photo search. Create a Pixabay
+API key, expose it only through the environment, then download the attributed
+source set and apply the recorded manual curation:
+
+```bash
+export PIXABAY_API_KEY="..."
+python3 scripts/download_pixabay_rooms.py \
+  --output data/backgrounds/pixabay_rooms --count 100
+python3 scripts/curate_pixabay_rooms.py
+```
+
+The downloader never writes the API key to disk. It records each photo's source
+page, contributor, tags, dimensions, and Pixabay license URL in `manifest.json`.
+The checked curation keeps 74 real room/interior scenes and moves 26 recoverable
+rejects to `data/backgrounds/pixabay_rooms_rejected`. Rejections contain a
+prominent person or animal, an illustration, or an object close-up that is not
+a useful scene. The numbered rejection list corresponds to this exact 100-image
+download, and each rejected manifest row records the reason.
+
+Install and enable the official MPFB extension in Blender 4.2 or newer, then
+render 1,000 pairs at TEED's native resolution:
+
+```bash
+blender --background --python scripts/generate_realistic_people.py -- \
+  --output data/teed_person_v4_synthetic \
+  --backgrounds data/backgrounds/pixabay_rooms \
+  --count 1000 --validation-count 100 --size 320 --seed 4104
+```
+
+The checked run contains 900 training pairs and 100 validation pairs. It uses
+63 room photos for training and holds out the other 11 photos exclusively for
+validation. `training.jsonl` and `validation.jsonl` can be read directly by the
+existing TEED training script. `metadata.json` records every shape, pose,
+background, and split decision.
+
+The selected V4 experiment continues from the selected V3 checkpoint at a
+lower learning rate. It retains the V3 silhouette-focused target and adds
+available COCO no-person images without depending on the original local CIHP
+download:
+
+```bash
+python3 scripts/train_teed_person_edges.py \
+  --epochs 4 --batch-size 16 --workers 4 --learning-rate 1e-5 \
+  --checkpoint checkpoints/teed_person_v3_silhouette/epoch-3.pth \
+  --teacher-checkpoint vendor/TEED/checkpoints/BIPED/5/5_model.pth \
+  --background-weight 0.5 --interior-edge-weight 0.25 \
+  --boundary-loss-weight 3 \
+  --train-manifest data/teed_person_v4_synthetic/training.jsonl \
+  --val-manifest data/teed_person_v4_synthetic/validation.jsonl \
+  --train-negative-manifest data/coco_no_person/training.jsonl \
+  --val-negative-manifest data/coco_no_person/validation.jsonl \
+  --train-negative-limit 300 --val-negative-limit 100 \
+  --output checkpoints/teed_person_v4_synthetic
+```
+
+All four epochs were compared with V3 on the 100 held-out synthetic people and
+100 real COCO no-person frames. Epoch 2 was selected for the boundary/background
+tradeoff rather than aggregate loss. At roughly matched COCO false-edge rates,
+V4 at threshold `0.46` reaches 7.14% silhouette recall and 5.22% positive-frame
+background leakage; V3 at threshold `0.54` reaches 5.95% and 3.99%, respectively.
+This is a 20% relative silhouette-recall gain with more background leakage, so
+V4 is an additional experiment rather than a replacement for V3.
+
+Export the selected checkpoint with:
+
+```bash
+python3 scripts/convert_teed.py \
+  checkpoints/teed_person_v4_synthetic/epoch-2.pth \
+  public/teed-person-v4-320.onnx --source vendor/TEED --size 320
+```
+
+The generated images, masks, metadata, and manifests live below `data/` and are
+ignored by Git. Re-running with the same seed, background set, Blender version,
+and MPFB version reproduces the sampling decisions.
+
 Open the printed localhost URL. Drop a browser-supported video onto the stage or
 select **Use webcam**. Webcam access works on localhost or HTTPS.
 
 Use the detector picker to compare:
 
 - **TEED** — the fastest neural option and the default.
+- **TEED Person V4 Synthetic** — favors full-body silhouette recall after
+  fine-tuning on rendered people in held-out room scenes.
 - **TEED Person V3 Silhouette** — emphasizes the outer person contour and uses
   calibrated confidence to suppress no-person scenes.
 - **TEED Person V2** — corrected masks, hard negatives, and stronger augmentation.
